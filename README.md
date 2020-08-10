@@ -1,7 +1,7 @@
 azsync
 ======
 
-A simple tool to let me sync a local directory to an Azure blob container. Unlike the standard az tool batch approach this will only upload files if they've been modified more recently and are actually different in content.
+A simple tool to let me duplicate a local directory to an Azure blob container. Unlike the standard az tool batch approach this will only upload files if they've been modified more recently and are actually different in content.
 
 Usage:
 
