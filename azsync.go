@@ -157,12 +157,17 @@ func executeOperations(containerURL azblob.ContainerURL, uploadPath string, oper
 			fullPath := path.Join(uploadPath, operation.Path)
 
 			mime, err := mimetype.DetectFile(fullPath)
+			fileMimeType := mime.String()
+			// an override for CSS, as CSS doesn't have a regular format to let us detect it
+			if path.Ext(operation.Path) == ".css" {
+				fileMimeType = "text/css"
+			}
 
 			f, err := os.Open(fullPath)
 			if err != nil {
 				return err
 			}
-			_, err = blobURL.Upload(ctx, f, azblob.BlobHTTPHeaders{ContentType: mime.String()}, azblob.Metadata{}, azblob.BlobAccessConditions{})
+			_, err = blobURL.Upload(ctx, f, azblob.BlobHTTPHeaders{ContentType: fileMimeType}, azblob.Metadata{}, azblob.BlobAccessConditions{})
 			f.Close()
 			if err != nil {
 				return err
