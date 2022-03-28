@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -203,13 +204,28 @@ func executeOperations(client azblob.ContainerClient, uploadPath string, operati
 	return nil
 }
 
-func main() {
+func printOperations(uploadPath string, operations []azureOperation) {
 
-	if len(os.Args) != 3 {
+	for _, operation := range operations {
+		switch operation.Operation {
+		case azureOperationTypeUpload:
+			fullPath := path.Join(uploadPath, operation.Path)
+			log.Printf("Upload %s as %s", fullPath, operation.Path)
+		case azureOperationTypeDelete:
+			log.Printf("Delete %s", operation.Path)
+		}
+	}
+}
+
+func main() {
+    practice := flag.Bool("p", false, "Practice run - just print out actions rather than execute.")
+    flag.Parse()
+
+	if flag.NArg() != 2 {
 		log.Fatal("Needs two arguments: [azure config] [local path]")
 	}
 
-	account, err := loadAzureAccountInfo(os.Args[1])
+	account, err := loadAzureAccountInfo(flag.Arg(0))
 	if err != nil {
 		log.Fatalf("Failed to load account info: %v", err)
 	}
@@ -224,13 +240,17 @@ func main() {
 		log.Fatalf("Failed to fetch info from Azure: %v", err)
 	}
 
-	operations, err := buildOperationList(os.Args[2], azInfo)
+	operations, err := buildOperationList(flag.Arg(1), azInfo)
 	if err != nil {
 		log.Fatalf("Failed to build operation list: %v", err)
 	}
 
-	err = executeOperations(client, os.Args[2], operations)
-	if err != nil {
-		log.Fatalf("Failed to execute operations: %v", err)
-	}
+    if *practice == false {
+        err = executeOperations(client, flag.Arg(1), operations)
+        if err != nil {
+            log.Fatalf("Failed to execute operations: %v", err)
+        }
+    } else {
+        printOperations(flag.Arg(1), operations)
+    }
 }
