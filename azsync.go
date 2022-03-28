@@ -9,13 +9,12 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/gabriel-vasile/mimetype"
 )
 
@@ -54,37 +53,53 @@ func loadAzureAccountInfo(configFilePath string) (azureAccountInfo, error) {
 	return accountInfo, err
 }
 
-func getAzureContainerURL(account azureAccountInfo) (azblob.ContainerURL, error) {
-	credential, err := azblob.NewSharedKeyCredential(account.Name, account.Key)
+func getAzureContainerClient(account azureAccountInfo) (azblob.ContainerClient, error) {
+	cred, err := azblob.NewSharedKeyCredential(account.Name, account.Key)
 	if err != nil {
-		return azblob.ContainerURL{}, err
+		return azblob.ContainerClient{}, err
 	}
 
-	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{})
-	url, _ := url.Parse(fmt.Sprintf("https://%s.blob.core.windows.net", account.Name))
-	serviceURL := azblob.NewServiceURL(*url, pipeline)
+	service, err := azblob.NewServiceClientWithSharedKey(fmt.Sprintf("https://%s.blob.core.windows.net/", account.Name), cred, nil)
+    if err != nil {
+        return azblob.ContainerClient{}, err
+    }
 
-	return serviceURL.NewContainerURL(account.Container), nil
+	containerClient := service.NewContainerClient(account.Container)
+
+	// Just check this client works - don't care about the results, just give
+	// us some confidence that we got the creds and names right
+	ctx := context.Background()
+	_, err = containerClient.GetProperties(ctx, nil)
+	if err != nil {
+	    return azblob.ContainerClient{}, err
+	}
+
+    return containerClient, nil
 }
 
-func getAzureInfo(containerURL azblob.ContainerURL) (map[string]azblob.BlobProperties, error) {
+func getAzureInfo(container azblob.ContainerClient) (map[string]azblob.BlobPropertiesInternal, error) {
 
-	ctx := context.Background()
+    // The sample code says to use nil here, but that causes a crash currently
+    options := azblob.ContainerListBlobFlatSegmentOptions{}
+	pager := container.ListBlobsFlat(&options)
+	if pager.Err() != nil {
+	    return nil, pager.Err()
+	}
 
-	info := make(map[string]azblob.BlobProperties)
+    ctx := context.Background()
+	info := make(map[string]azblob.BlobPropertiesInternal)
 
-	for marker := (azblob.Marker{}); marker.NotDone(); {
-		listBlob, err := containerURL.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{})
-		if err != nil {
-			return nil, err
-		}
-		marker = listBlob.NextMarker
+	for pager.NextPage(ctx) {
+		resp := pager.PageResponse()
 
-		for _, item := range listBlob.Segment.BlobItems {
-			info[item.Name] = item.Properties
+		for _, item := range resp.ContainerListBlobFlatSegmentResult.Segment.BlobItems {
+		    if item.Name != nil && item.Properties != nil {
+    			info[*item.Name] = *item.Properties
+    		}
 		}
 	}
-	return info, nil
+
+    return info, nil
 }
 
 func fileHash(path string) ([]byte, error) {
@@ -102,7 +117,7 @@ func fileHash(path string) ([]byte, error) {
 	return hash.Sum(nil)[:16], nil
 }
 
-func buildOperationList(uploadPath string, azureInfo map[string]azblob.BlobProperties) ([]azureOperation, error) {
+func buildOperationList(uploadPath string, azureInfo map[string]azblob.BlobPropertiesInternal) ([]azureOperation, error) {
 
 	operations := make([]azureOperation, 0)
 
@@ -117,12 +132,11 @@ func buildOperationList(uploadPath string, azureInfo map[string]azblob.BlobPrope
 		localPath := strings.TrimPrefix(path, uploadPath)
 
 		if remoteInfo, ok := azureInfo[localPath]; ok {
-			if localInfo.ModTime().After(remoteInfo.LastModified) {
-				localContentMD5, err := fileHash(path)
+		    if localInfo.ModTime().After(*remoteInfo.LastModified) {
+			    localContentMD5, err := fileHash(path)
 				if err != nil {
 					return err
 				}
-
 				if bytes.Compare(localContentMD5, remoteInfo.ContentMD5) != 0 {
 					operations = append(operations, azureOperation{Operation: azureOperationTypeUpload, Path: localPath})
 				}
@@ -144,13 +158,13 @@ func buildOperationList(uploadPath string, azureInfo map[string]azblob.BlobPrope
 	return operations, err
 }
 
-func executeOperations(containerURL azblob.ContainerURL, uploadPath string, operations []azureOperation) error {
+func executeOperations(client azblob.ContainerClient, uploadPath string, operations []azureOperation) error {
 
 	ctx := context.Background()
 
 	for _, operation := range operations {
 
-		blobURL := containerURL.NewBlockBlobURL(operation.Path)
+    	blobClient := client.NewBlockBlobClient(operation.Path)
 
 		switch operation.Operation {
 		case azureOperationTypeUpload:
@@ -167,7 +181,9 @@ func executeOperations(containerURL azblob.ContainerURL, uploadPath string, oper
 			if err != nil {
 				return err
 			}
-			_, err = blobURL.Upload(ctx, f, azblob.BlobHTTPHeaders{ContentType: fileMimeType}, azblob.Metadata{}, azblob.BlobAccessConditions{})
+			headers := azblob.BlobHTTPHeaders{BlobContentType: &fileMimeType}
+			options := azblob.UploadBlockBlobOptions{HTTPHeaders: &headers}
+			_, err = blobClient.Upload(ctx, f, &options)
 			f.Close()
 			if err != nil {
 				return err
@@ -177,7 +193,7 @@ func executeOperations(containerURL azblob.ContainerURL, uploadPath string, oper
 
 		case azureOperationTypeDelete:
 
-			_, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{})
+			_, err := blobClient.Delete(ctx, nil)
 			if err != nil {
 				return err
 			}
@@ -198,12 +214,12 @@ func main() {
 		log.Fatalf("Failed to load account info: %v", err)
 	}
 
-	containerURL, err := getAzureContainerURL(account)
+	client, err := getAzureContainerClient(account)
 	if err != nil {
-		log.Fatalf("Failed to get container URL: %v", err)
+		log.Fatalf("Failed to create container client: %v", err)
 	}
 
-	azInfo, err := getAzureInfo(containerURL)
+	azInfo, err := getAzureInfo(client)
 	if err != nil {
 		log.Fatalf("Failed to fetch info from Azure: %v", err)
 	}
@@ -213,7 +229,7 @@ func main() {
 		log.Fatalf("Failed to build operation list: %v", err)
 	}
 
-	err = executeOperations(containerURL, os.Args[2], operations)
+	err = executeOperations(client, os.Args[2], operations)
 	if err != nil {
 		log.Fatalf("Failed to execute operations: %v", err)
 	}
