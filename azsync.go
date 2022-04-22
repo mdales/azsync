@@ -146,7 +146,7 @@ func buildOperationList(uploadPath string, azureInfo map[string]azblob.BlobPrope
 					operations = append(operations, azureOperation{
 					    Operation: azureOperationTypeUpload,
 					    Path: localPath,
-					    Reason: fmt.Sprintf("Hash mismatch, and %v > %v", localInfo.ModTime(), *remoteInfo.LastModified),
+					    Reason: fmt.Sprintf("Hash mismatch %v vs %v, and %v > %v", localContentMD5, remoteInfo.ContentMD5, localInfo.ModTime(), *remoteInfo.LastModified),
 					})
 				}
 			}
@@ -196,12 +196,19 @@ func executeOperations(client *azblob.ContainerClient, uploadPath string, operat
 			if path.Ext(operation.Path) == ".css" {
 				fileMimeType = "text/css"
 			}
-
+            localContentMD5, err := fileHash(fullPath)
+            if err != nil {
+                return err
+            }
 			f, err := os.Open(fullPath)
 			if err != nil {
 				return err
 			}
-			headers := azblob.BlobHTTPHeaders{BlobContentType: &fileMimeType}
+
+			headers := azblob.BlobHTTPHeaders{
+			    BlobContentType: &fileMimeType,
+			    BlobContentMD5: localContentMD5,
+			}
 			options := azblob.BlockBlobUploadOptions{HTTPHeaders: &headers}
 			_, err = blobClient.Upload(ctx, f, &options)
 			f.Close()
