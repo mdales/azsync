@@ -35,6 +35,7 @@ const (
 type azureOperation struct {
 	Operation azureOperationType
 	Path      string
+	Reason    string
 }
 
 func loadAzureAccountInfo(configFilePath string) (azureAccountInfo, error) {
@@ -54,34 +55,37 @@ func loadAzureAccountInfo(configFilePath string) (azureAccountInfo, error) {
 	return accountInfo, err
 }
 
-func getAzureContainerClient(account azureAccountInfo) (azblob.ContainerClient, error) {
+func getAzureContainerClient(account azureAccountInfo) (*azblob.ContainerClient, error) {
 	cred, err := azblob.NewSharedKeyCredential(account.Name, account.Key)
 	if err != nil {
-		return azblob.ContainerClient{}, err
+		return nil, err
 	}
 
 	service, err := azblob.NewServiceClientWithSharedKey(fmt.Sprintf("https://%s.blob.core.windows.net/", account.Name), cred, nil)
     if err != nil {
-        return azblob.ContainerClient{}, err
+        return nil, err
     }
 
-	containerClient := service.NewContainerClient(account.Container)
+	containerClient, err := service.NewContainerClient(account.Container)
+	if err != nil {
+	    return nil, err
+	}
 
 	// Just check this client works - don't care about the results, just give
 	// us some confidence that we got the creds and names right
 	ctx := context.Background()
 	_, err = containerClient.GetProperties(ctx, nil)
 	if err != nil {
-	    return azblob.ContainerClient{}, err
+	    return nil, err
 	}
 
     return containerClient, nil
 }
 
-func getAzureInfo(container azblob.ContainerClient) (map[string]azblob.BlobPropertiesInternal, error) {
+func getAzureInfo(container *azblob.ContainerClient) (map[string]azblob.BlobPropertiesInternal, error) {
 
     // The sample code says to use nil here, but that causes a crash currently
-    options := azblob.ContainerListBlobFlatSegmentOptions{}
+    options := azblob.ContainerListBlobsFlatOptions{}
 	pager := container.ListBlobsFlat(&options)
 	if pager.Err() != nil {
 	    return nil, pager.Err()
@@ -93,7 +97,7 @@ func getAzureInfo(container azblob.ContainerClient) (map[string]azblob.BlobPrope
 	for pager.NextPage(ctx) {
 		resp := pager.PageResponse()
 
-		for _, item := range resp.ContainerListBlobFlatSegmentResult.Segment.BlobItems {
+		for _, item := range resp.Segment.BlobItems {
 		    if item.Name != nil && item.Properties != nil {
     			info[*item.Name] = *item.Properties
     		}
@@ -139,13 +143,21 @@ func buildOperationList(uploadPath string, azureInfo map[string]azblob.BlobPrope
 					return err
 				}
 				if bytes.Compare(localContentMD5, remoteInfo.ContentMD5) != 0 {
-					operations = append(operations, azureOperation{Operation: azureOperationTypeUpload, Path: localPath})
+					operations = append(operations, azureOperation{
+					    Operation: azureOperationTypeUpload,
+					    Path: localPath,
+					    Reason: fmt.Sprintf("Hash mismatch, and %v > %v", localInfo.ModTime(), *remoteInfo.LastModified),
+					})
 				}
 			}
 			// remove so we can work out what's in azure but not local
 			delete(azureInfo, localPath)
 		} else {
-			operations = append(operations, azureOperation{Operation: azureOperationTypeUpload, Path: localPath})
+			operations = append(operations, azureOperation{
+			    Operation: azureOperationTypeUpload,
+			    Path: localPath,
+			    Reason: "Missing at remote",
+			})
 		}
 
 		return nil
@@ -153,19 +165,26 @@ func buildOperationList(uploadPath string, azureInfo map[string]azblob.BlobPrope
 
 	// anything not removed above is on Azure and not local, so needs deleted
 	for path := range azureInfo {
-		operations = append(operations, azureOperation{Operation: azureOperationTypeDelete, Path: path})
+		operations = append(operations, azureOperation{
+		    Operation: azureOperationTypeDelete,
+		    Path: path,
+		    Reason: "No longer local",
+		})
 	}
 
 	return operations, err
 }
 
-func executeOperations(client azblob.ContainerClient, uploadPath string, operations []azureOperation) error {
+func executeOperations(client *azblob.ContainerClient, uploadPath string, operations []azureOperation) error {
 
 	ctx := context.Background()
 
 	for _, operation := range operations {
 
-    	blobClient := client.NewBlockBlobClient(operation.Path)
+    	blobClient, err := client.NewBlockBlobClient(operation.Path)
+    	if err != nil {
+    	    return fmt.Errorf("failed to create blob client: %w", err)
+    	}
 
 		switch operation.Operation {
 		case azureOperationTypeUpload:
@@ -183,13 +202,12 @@ func executeOperations(client azblob.ContainerClient, uploadPath string, operati
 				return err
 			}
 			headers := azblob.BlobHTTPHeaders{BlobContentType: &fileMimeType}
-			options := azblob.UploadBlockBlobOptions{HTTPHeaders: &headers}
+			options := azblob.BlockBlobUploadOptions{HTTPHeaders: &headers}
 			_, err = blobClient.Upload(ctx, f, &options)
 			f.Close()
 			if err != nil {
 				return err
 			}
-
 			log.Printf("Uploaded %s", operation.Path)
 
 		case azureOperationTypeDelete:
@@ -210,9 +228,9 @@ func printOperations(uploadPath string, operations []azureOperation) {
 		switch operation.Operation {
 		case azureOperationTypeUpload:
 			fullPath := path.Join(uploadPath, operation.Path)
-			log.Printf("Upload %s as %s", fullPath, operation.Path)
+			log.Printf("Upload (%s) %s as %s", operation.Reason, fullPath, operation.Path)
 		case azureOperationTypeDelete:
-			log.Printf("Delete %s", operation.Path)
+			log.Printf("Delete (%s) %s", operation.Reason, operation.Path)
 		}
 	}
 }
@@ -222,7 +240,8 @@ func main() {
     flag.Parse()
 
 	if flag.NArg() != 2 {
-		log.Fatal("Needs two arguments: [azure config] [local path]")
+		log.Fatal("Usage: azsync [-p] [azure config] [local path]")
+
 	}
 
 	account, err := loadAzureAccountInfo(flag.Arg(0))
